@@ -74,12 +74,13 @@ RUN apt-get update && apt-get install -y \
     sudo \
     redis-server \
     postgresql-${POSTGRES_VERSION} \
+    curl \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Setup Node.js
-RUN useradd -m nuxt \
-    && su nuxt -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.3/install.sh | bash" \
-    && su nuxt -c ". ~/.nvm/nvm.sh && nvm install ${NODE_VERSION}"
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
+    && apt-get install -y nodejs \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy configuration files
 COPY docker/postgres-wrapper.sh docker/php-fpm-wrapper.sh docker/redis-wrapper.sh \
