@@ -1,98 +1,113 @@
-ARG PHP_PACKAGES="php8.1 composer php8.1-common php8.1-pgsql php8.1-redis php8.1-mbstring\
-        php8.1-simplexml php8.1-bcmath php8.1-gd php8.1-curl php8.1-zip\
-        php8.1-imagick php8.1-bz2 php8.1-gmp php8.1-int php8.1-pcov php8.1-soap php8.1-xsl"
+# Use ARG for reusable variables
+ARG PHP_VERSION=8.3
+ARG NODE_VERSION=20
+ARG POSTGRES_VERSION=15
+ARG UBUNTU_VERSION=latest
 
-FROM node:20-alpine AS javascript-builder
+# Base PHP image
+FROM ubuntu:${UBUNTU_VERSION} AS php-base
+ENV DEBIAN_FRONTEND=noninteractive
+ARG PHP_VERSION
+
+# Install common dependencies
+RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    wget gnupg2 lsb-release \
+    && add-apt-repository -y ppa:ondrej/php \
+    && wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
+    && echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get upgrade -y \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install PHP and extensions
+RUN apt-get update && apt-get install -y \
+    php${PHP_VERSION} \
+    php${PHP_VERSION}-common \
+    php${PHP_VERSION}-pgsql \
+    php${PHP_VERSION}-redis \
+    php${PHP_VERSION}-mbstring \
+    php${PHP_VERSION}-xml \
+    php${PHP_VERSION}-bcmath \
+    php${PHP_VERSION}-gd \
+    php${PHP_VERSION}-curl \
+    php${PHP_VERSION}-zip \
+    php${PHP_VERSION}-imagick \
+    php${PHP_VERSION}-bz2 \
+    php${PHP_VERSION}-gmp \
+    php${PHP_VERSION}-intl \
+    php${PHP_VERSION}-pcov \
+    php${PHP_VERSION}-soap \
+    php${PHP_VERSION}-xsl \
+    php${PHP_VERSION}-fpm \
+    php-curl \
+    composer \
+    && phpenmod curl xml pgsql \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Node.js builder stage
+FROM node:${NODE_VERSION}-alpine AS javascript-builder
 WORKDIR /app
-
-# It's best to add as few files as possible before running the build commands
-# as they will be re-run everytime one of those files changes.
-#
-# It's possible to run npm install with only the package.json and package-lock.json file.
-
-ADD client/package.json client/package-lock.json ./
-RUN npm install
-
-ADD client /app/
-RUN cp .env.docker .env
+COPY client/package*.json ./
+RUN npm ci
+COPY client .
+COPY client/.env.docker .env
 RUN npm run build
 
-# syntax=docker/dockerfile:1.3-labs
-FROM --platform=linux/amd64 ubuntu:23.04 AS php-dependency-installer
-
-ARG PHP_PACKAGES
-
-RUN apt-get update \
-    && apt-get install -y $PHP_PACKAGES composer
-
+# PHP dependencies stage
+FROM php-base AS php-dependency-installer
 WORKDIR /app
-ADD composer.json composer.lock artisan ./
+COPY composer.* artisan ./
+COPY app/helpers.php app/helpers.php
+RUN composer install --no-scripts --no-autoloader
+COPY . .
+RUN composer dump-autoload --optimize && composer run-script post-autoload-dump
 
-# NOTE: The project would build more reliably if all php files were added before running
-# composer install.  This would though introduce a dependency which would cause every
-# dependency to be re-installed each time any php file is edited.  It may be necessary in
-# future to remove this 'optimisation' by moving the `RUN composer install` line after all
-# the following ADD commands.
+# Final stage
+FROM php-base
+ARG PHP_VERSION
+ARG POSTGRES_VERSION
 
-# Running artisan requires the full php app to be installed so we need to remove the
-# post-autoload command from the composer file if we want to run composer without
-# adding a dependency to all the php files.
-RUN sed 's_@php artisan package:discover_/bin/true_;' -i composer.json
-ADD app/helpers.php /app/app/helpers.php
-RUN composer install --ignore-platform-req=php
+# Install additional packages
+RUN apt-get update && apt-get install -y \
+    supervisor \
+    nginx \
+    sudo \
+    redis-server \
+    postgresql-${POSTGRES_VERSION} \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-ADD app /app/app
-ADD bootstrap /app/bootstrap
-ADD config /app/config
-ADD database /app/database
-ADD public public
-ADD routes routes
-ADD tests tests
+# Setup Node.js
+RUN useradd -m nuxt \
+    && su nuxt -c "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.3/install.sh | bash" \
+    && su nuxt -c ". ~/.nvm/nvm.sh && nvm install ${NODE_VERSION}"
 
-# Manually run the command we deleted from composer.json earlier
-RUN php artisan package:discover --ansi
+# Copy configuration files
+COPY docker/postgres-wrapper.sh docker/php-fpm-wrapper.sh docker/redis-wrapper.sh \
+    docker/nuxt-wrapper.sh docker/generate-api-secret.sh /usr/local/bin/
+COPY docker/php-fpm.conf /etc/php/${PHP_VERSION}/fpm/pool.d/
+COPY docker/nginx.conf /etc/nginx/sites-enabled/default
+COPY docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
-
-FROM --platform=linux/amd64 ubuntu:23.04
-
-# supervisord is a process manager which will be responsible for managing the
-# various server processes.  These are configured in docker/supervisord.conf
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
-
+# Copy application files
 WORKDIR /app
-
-ARG PHP_PACKAGES
-
-RUN apt-get update \
-    && apt-get install -y \
-        supervisor nginx sudo postgresql-15 redis\
-        $PHP_PACKAGES php8.1-fpm wget\
-    && apt-get clean
-
-RUN useradd nuxt && mkdir ~nuxt && chown nuxt ~nuxt
-RUN wget -qO- https://raw.githubusercontent.com/creationix/nvm/v0.39.3/install.sh | sudo -u nuxt bash
-RUN sudo -u nuxt bash -c ". ~nuxt/.nvm/nvm.sh && nvm install --no-progress 20"
-
-ADD docker/postgres-wrapper.sh docker/php-fpm-wrapper.sh docker/redis-wrapper.sh docker/nuxt-wrapper.sh docker/generate-api-secret.sh /usr/local/bin/
-ADD docker/php-fpm.conf /etc/php/8.1/fpm/pool.d/
-ADD docker/nginx.conf /etc/nginx/sites-enabled/default
-ADD docker/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-ADD . .
-ADD .env.docker .env
-ADD client/.env.docker client/.env
-
 COPY --from=javascript-builder /app/.output/ ./nuxt/
-RUN cp -r nuxt/public .
-COPY --from=php-dependency-installer /app/vendor/ ./vendor/
+COPY --from=php-dependency-installer /app .
+COPY .env.docker .env
+COPY client/.env.docker client/.env
 
-RUN chmod a+x /usr/local/bin/*.sh /app/artisan \
+# Set permissions and configurations
+RUN cp -r nuxt/public . \
+    && chmod -R 777 /app/client /var/run /app/.env \
+    && echo 'variables_order = "EGPCS"' >> /etc/php/${PHP_VERSION}/cli/php.ini \
+    && echo 'variables_order = "EGPCS"' >> /etc/php/${PHP_VERSION}/fpm/php.ini \
+    && chmod a+x /usr/local/bin/*.sh /app/artisan \
     && ln -s /app/artisan /usr/local/bin/artisan \
     && useradd opnform \
-    && echo "daemon off;" >> /etc/nginx/nginx.conf\
-    && echo "daemonize no" >> /etc/redis/redis.conf\
-    && echo "appendonly yes" >> /etc/redis/redis.conf\
+    && echo "daemon off;" >> /etc/nginx/nginx.conf \
+    && echo "daemonize no" >> /etc/redis/redis.conf \
+    && echo "appendonly yes" >> /etc/redis/redis.conf \
     && echo "dir /persist/redis/data" >> /etc/redis/redis.conf
 
-
 EXPOSE 80
+
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/supervisord.conf"]
